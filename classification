@@ -1,0 +1,302 @@
+import os
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import swin_t, Swin_T_Weights
+from torchvision.models import resnet50  # 修改1：导入ResNet50
+from sklearn.metrics import (confusion_matrix, roc_curve, auc,
+                             precision_score, recall_score,
+                             accuracy_score, f1_score)
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+
+
+# 自定义数据集（返回文件名）
+class CustomImageFolder(Dataset):
+    def __init__(self, root, transform=None):
+        self.image_folder = ImageFolder(root, transform)
+
+    def __len__(self):
+        return len(self.image_folder)
+
+    def __getitem__(self, idx):
+        img, label = self.image_folder[idx]
+        file_name = os.path.basename(self.image_folder.imgs[idx][0])
+        return img, label, file_name
+
+
+# 固定随机种子
+def same_seeds(seed=1):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+# 评估测试集
+@torch.no_grad()
+def evaluate_testset(model, loader, device, criterion, epoch):
+    model.eval()
+    loss_list, labels_list, preds_list, score_list = [], [], [], []
+    results_test = []
+
+    for images, labels, file_name in loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+
+        prob_cls1 = F.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+        preds = outputs.argmax(1).cpu().numpy()
+        labels_np = labels.cpu().numpy()
+
+        # 保存单张结果
+        for j in range(len(labels_np)):
+            results_test.append({
+                'File Name': file_name[j],
+                'True Label': labels_np[j],
+                'Predicted Label': preds[j],
+                'pre_score': prob_cls1[j]
+            })
+
+        loss_list.append(criterion(outputs, labels).item())
+        labels_list.extend(labels_np)
+        preds_list.extend(preds)
+        score_list.extend(prob_cls1)
+
+    # 写 csv
+    os.makedirs('out', exist_ok=True)
+    pd.DataFrame(results_test).to_csv(f"out/Epoch{epoch}_output_test.csv", index=False)
+
+    # 计算指标
+    cm = confusion_matrix(labels_list, preds_list)
+    TN, FP, FN, TP = cm.ravel()
+    fpr, tpr, _ = roc_curve(labels_list, score_list)
+
+    log = dict(epoch=epoch,
+               test_loss=np.mean(loss_list),
+               test_accuracy=accuracy_score(labels_list, preds_list),
+               test_precision=precision_score(labels_list, preds_list),
+               test_recall=recall_score(labels_list, preds_list),
+               test_f1=f1_score(labels_list, preds_list),
+               test_auc=auc(fpr, tpr),
+               test_spe=TN / (TN + FP),
+               test_sen=TP / (TP + FN),
+               test_fpr=fpr,
+               test_tpr=tpr)
+
+    print(f"Test acc={log['test_accuracy']:.4f}  auc={log['test_auc']:.4f}  "
+          f"spe={log['test_spe']:.4f}  sen={log['test_sen']:.4f}")
+    return log
+
+
+# 训练一个 batch
+def train_one_batch(model, images, labels, criterion, optimizer, device,
+                    results_train, epoch, batch_idx, file_names):
+    images, labels = images.to(device), labels.to(device)
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    # 必须先 detach 再转 numpy
+    prob_cls1 = F.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()
+    preds = outputs.detach().argmax(1).cpu().numpy()
+    labels_np = labels.cpu().numpy()
+
+    # 保存单张结果
+    for j in range(len(labels_np)):
+        results_train.append({
+            'File Name': file_names[j],
+            'True Label': labels_np[j],
+            'Predicted Label': preds[j],
+            'pre_score': prob_cls1[j]
+        })
+
+    fpr, tpr, _ = roc_curve(labels_np, prob_cls1)
+    cm = confusion_matrix(labels_np, preds)
+    tn, fp, fn, tp = cm.ravel()
+
+    log = dict(epoch=epoch,
+               batch=batch_idx,
+               train_loss=loss.item(),
+               train_accuracy=accuracy_score(labels_np, preds),
+               train_precision=precision_score(labels_np, preds),
+               train_recall=recall_score(labels_np, preds),
+               train_f1=f1_score(labels_np, preds),
+               train_auc=auc(fpr, tpr),
+               train_spe=tn / (tn + fp),
+               train_sen=tp / (tp + fn),
+               train_fpr=fpr,
+               train_tpr=tpr)
+    return log
+
+
+# 绘制和保存 ROC 曲线
+def save_roc_curve(fpr, tpr, title, filepath):
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, label=f'AUC={auc(fpr, tpr):.3f}')
+    plt.plot([0, 1], [0, 1], 'k--', label='Random')
+    plt.xlim([0, 1]);
+    plt.ylim([0, 1])
+    plt.xlabel('False Positive Rate');
+    plt.ylabel('True Positive Rate')
+    plt.title(title);
+    plt.legend();
+    plt.grid(True)
+    plt.savefig(filepath)
+    plt.close()  # 关闭当前图形，以释放内存
+
+
+# 主流程
+if __name__ == '__main__':
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    same_seeds(1)
+
+    # 数据增强
+    train_tf = transforms.Compose([
+        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+    test_tf = transforms.Compose([
+        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+    # 数据集
+    dataset_dir = 'dataset'  # 修改为自己的根目录
+    train_set = CustomImageFolder(os.path.join(dataset_dir, 'train'), train_tf)
+    test_set = CustomImageFolder(os.path.join(dataset_dir, 'val'), test_tf)
+
+
+    def show_class_info(dataset, name='Dataset'):
+        class_to_idx = dataset.image_folder.class_to_idx
+        idx_to_class = {v: k for k, v in class_to_idx.items()}
+        targets = np.array(dataset.image_folder.targets)
+        counts = np.bincount(targets)
+
+        print(f'\n{name} 共有 {len(dataset)} 张图像，{len(class_to_idx)} 个类别:')
+        print('-' * 50)
+        for idx, cnt in enumerate(counts):
+            print(f'Index {idx:2d}  类别名: {idx_to_class[idx]:15s}  数量: {cnt}')
+        print('-' * 50)
+
+
+    # 调用
+    show_class_info(train_set, 'Train set')
+    show_class_info(test_set, 'Test set')
+
+    train_loader = DataLoader(train_set, batch_size=32,
+                              shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_set, batch_size=32,
+                             shuffle=False, num_workers=4)
+
+    # # 模型 - 修改为 Swin Transformer
+    # model = swin_t(weights=Swin_T_Weights.IMAGENET1K_V1)  # 使用预训练的 Swin-T
+    # # 修改最后的分类头以适应二分类任务
+    # model.head = nn.Linear(model.head.in_features, 2)
+    # model = model.to(device)
+
+    model = resnet50(weights='DEFAULT')
+    # 修改最后一层全连接层以适应二分类任务
+    model.fc = nn.Linear(model.fc.in_features, 2)
+    model = model.to(device)
+
+
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-2)
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.9)
+    criterion = nn.CrossEntropyLoss()
+
+    # 创建 roc 文件夹
+    os.makedirs('roc', exist_ok=True)
+
+    # 训练
+    EPOCHS = 30
+    best_acc = 0.0
+    results_train = []
+    best_auc = 0.0
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f'\nEpoch {epoch}/{EPOCHS}')
+        model.train()
+        all_train_prob_cls1 = []  # 收集所有 batch 的预测概率
+        all_train_labels = []  # 收集所有 batch 的真实标签
+        # 用于存储每个 batch 的指标
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_aucs = []
+        epoch_spes = []
+        epoch_sens = []
+
+        for batch_idx, (imgs, labs, file_names) in enumerate(tqdm(train_loader, ncols=80), 1):
+            train_log = train_one_batch(model, imgs, labs, criterion,
+                                        optimizer, device,
+                                        results_train, epoch, batch_idx, file_names)
+
+            # 记录每个 batch 的指标
+            epoch_losses.append(train_log['train_loss'])
+            epoch_accuracies.append(train_log['train_accuracy'])
+            epoch_aucs.append(train_log['train_auc'])
+            epoch_spes.append(train_log['train_spe'])
+            epoch_sens.append(train_log['train_sen'])
+
+        # 计算每个 epoch 的平均指标
+        avg_loss = np.mean(epoch_losses)
+        avg_acc = np.mean(epoch_accuracies)
+        avg_auc = np.mean(epoch_aucs)
+        avg_spe = np.mean(epoch_spes)
+        avg_sen = np.mean(epoch_sens)
+
+        # 打印 epoch 训练指标
+        print(f"Train epoch {epoch}: "
+              f"loss={avg_loss:.4f}, "
+              f"acc={avg_acc:.4f}, "
+              f"auc={avg_auc:.4f}, "
+              f"spe={avg_spe:.4f}, "
+              f"sen={avg_sen:.4f}")
+
+        # 保存训练集预测
+        os.makedirs('out', exist_ok=True)
+        pd.DataFrame(results_train).to_csv(f"out/Epoch{epoch}_output_train.csv", index=False)
+        results_train.clear()
+        scheduler.step()
+
+        # 测试
+        test_log = evaluate_testset(model, test_loader, device, criterion, epoch)
+
+        # 保存 ROC 曲线
+        save_roc_curve(train_log['train_fpr'], train_log['train_tpr'],
+                       title='Train ROC - Epoch {}'.format(epoch),
+                       filepath=f'roc/train_epoch_{epoch}.png')
+        save_roc_curve(test_log['test_fpr'], test_log['test_tpr'],
+                       title='Test ROC - Epoch {}'.format(epoch),
+                       filepath=f'roc/test_epoch_{epoch}.png')
+
+        # 保存最佳模型
+        if test_log['test_accuracy'] > best_acc:
+            best_acc = test_log['test_accuracy']
+            os.makedirs('checkpoint', exist_ok=True)
+            best_path = f'checkpoint/best-{best_acc:.3f}.pth'
+            torch.save(model.state_dict(), best_path)
+            print(f'保存新的最佳模型: {best_path}')
+        # 保存最佳模型
+        # if test_log['test_auc'] > best_auc:
+        #     best_auc = test_log['test_auc']
+        #     os.makedirs('checkpoint', exist_ok=True)
+        #     best_path = f'checkpoint/best-{best_auc:.3f}.pth'
+        #     torch.save(model.state_dict(), best_path)
+        #     print(f'保存新的最佳模型: {best_path}')
+    print('Finished training!')
