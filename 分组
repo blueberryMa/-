@@ -1,0 +1,43 @@
+import os
+import random
+import shutil
+
+def split_data(source_dir_max, source_dir_min, train_ratio=0.7):
+    # 创建目标目录
+    os.makedirs('dataset/train/max', exist_ok=True)
+    os.makedirs('dataset/train/min', exist_ok=True)
+    os.makedirs('dataset/val/max', exist_ok=True)
+    os.makedirs('dataset/val/min', exist_ok=True)
+
+    # 获取 max 和 min 文件夹中的文件列表
+    files_max = os.listdir(source_dir_max)
+    files_min = os.listdir(source_dir_min)
+
+    # 随机打乱文件顺序
+    random.shuffle(files_max)
+    random.shuffle(files_min)
+
+    # 计算分割点
+    split_idx_max = int(len(files_max) * train_ratio)
+    split_idx_min = int(len(files_min) * train_ratio)
+
+    # 分割 max 文件
+    for i, file in enumerate(files_max):
+        src = os.path.join(source_dir_max, file)
+        if i < split_idx_max:
+            dst = os.path.join('dataset/train/max', file)
+        else:
+            dst = os.path.join('dataset/val/max', file)
+        shutil.copy2(src, dst)  # 保留文件元数据
+
+    # 分割 min 文件
+    for i, file in enumerate(files_min):
+        src = os.path.join(source_dir_min, file)
+        if i < split_idx_min:
+            dst = os.path.join('dataset/train/min', file)
+        else:
+            dst = os.path.join('dataset/val/min', file)
+        shutil.copy2(src, dst)
+
+if __name__ == "__main__":
+    split_data('D:/pancreas/max', 'D:/pancreas/min')
