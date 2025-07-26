@@ -1,0 +1,119 @@
+import os
+import numpy as np
+import nibabel as nib
+from PIL import Image
+
+
+def apply_window_level(image_data, window_width=400, window_level=40):
+    """
+    应用CT窗宽窗位设置
+    默认使用腹部CT常用设置：窗宽400HU，窗位40HU
+    """
+    # 计算窗口范围
+    window_min = window_level - window_width // 2
+    window_max = window_level + window_width // 2
+
+    # 应用窗口
+    windowed = np.clip(image_data, window_min, window_max)
+
+    # 归一化到0-255
+    windowed = (windowed - window_min) / (window_max - window_min) * 255
+    windowed = np.clip(windowed, 0, 255).astype(np.uint8)
+
+    return windowed
+
+
+def extract_central_label_slice(image_path, label_path, output_dir):
+    # 加载图像和标签数据
+    img_nii = nib.load(image_path)
+    label_nii = nib.load(label_path)
+
+    img_data = img_nii.get_fdata()
+    label_data = label_nii.get_fdata()
+
+    # 确保图像和标签尺寸一致
+    if img_data.shape != label_data.shape:
+        raise ValueError(
+            f"Image and label dimensions do not match. "
+            f"Image shape: {img_data.shape}, Label shape: {label_data.shape}"
+        )
+
+    # 找到包含标签的最小范围
+    z_indices = np.where(np.any(label_data, axis=(0, 1)))[0]
+    if len(z_indices) == 0:
+        raise ValueError("No label found in the volume")
+
+    # 计算最小ROI的中心层面
+    min_slice = z_indices.min()
+    max_slice = z_indices.max()
+    central_slice = (min_slice + max_slice) // 2
+
+    # 提取该层面的图像
+    central_img_slice = img_data[:, :, central_slice]
+
+    # 应用腹部CT窗宽窗位设置
+    windowed_slice = apply_window_level(central_img_slice)
+
+    # 旋转图像使其方向正确（根据nii文件可能需要调整）
+    windowed_slice = np.rot90(windowed_slice, k=1)
+
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 使用原始image文件名作为输出文件名
+    base_name = os.path.basename(image_path)
+    output_filename = os.path.splitext(base_name)[0]  # 移除扩展名
+    if output_filename.endswith('.nii'):
+        output_filename = os.path.splitext(output_filename)[0]  # 处理双重扩展名.nii.gz
+    output_filename = f"{output_filename}.jpg"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # 使用最高质量保存JPG
+    Image.fromarray(windowed_slice).save(output_path, quality=95)
+
+    return output_path
+
+
+def process_folders(image_dir, label_dir, output_dir):
+    # 检查输入目录是否存在
+    if not os.path.exists(image_dir):
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    if not os.path.exists(label_dir):
+        raise FileNotFoundError(f"Label directory not found: {label_dir}")
+
+    # 获取image文件夹中的所有NIfTI文件
+    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.nii', '.nii.gz'))]
+
+    if not image_files:
+        print(f"No NIfTI files found in image directory: {image_dir}")
+        return
+
+    processed_count = 0
+    for img_file in image_files:
+        # 构建对应的label文件名（假设文件名相同）
+        label_file = img_file
+
+        image_path = os.path.join(image_dir, img_file)
+        label_path = os.path.join(label_dir, label_file)
+
+        if os.path.exists(label_path):
+            try:
+                output_path = extract_central_label_slice(image_path, label_path, output_dir)
+                print(f"Processed {img_file}, saved to {output_path}")
+                processed_count += 1
+            except Exception as e:
+                print(f"Error processing {img_file}: {str(e)}")
+        else:
+            print(f"Label file not found for {img_file}")
+
+    print(f"\nProcessing complete. Successfully processed {processed_count}/{len(image_files)} files.")
+
+
+if __name__ == "__main__":
+    # 设置路径（请修改为你的实际路径）
+    image_dir = r"D:\pancreas\image"  # image文件夹路径
+    label_dir = r"D:\pancreas\label"  # label文件夹路径
+    output_dir = r"D:\pancreas\min"  # 输出文件夹路径
+
+    # 处理所有文件
+    process_folders(image_dir, label_dir, output_dir)
