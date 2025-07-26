@@ -1,0 +1,101 @@
+import os
+import SimpleITK as sitk
+import pydicom
+import shutil
+
+
+def is_dicom_folder(folder_path):
+    """检查文件夹是否包含DICOM文件"""
+    for f in os.listdir(folder_path):
+        if f.lower().endswith('.dcm') or f.lower().endswith('.dicom'):
+            return True
+    return False
+
+
+def find_dicom_folders(root_path):
+    """递归查找包含DICOM文件的文件夹，并记录其第一层父文件夹名称"""
+    dicom_folders = []
+    first_level_names = {}
+
+    # 先获取第一层文件夹名称
+    first_level_dirs = [d for d in os.listdir(root_path)
+                        if os.path.isdir(os.path.join(root_path, d))]
+
+    for root, dirs, files in os.walk(root_path):
+        if is_dicom_folder(root):
+            # 获取相对于根目录的路径
+            rel_path = os.path.relpath(root, root_path)
+            # 提取第一层文件夹名称
+            first_level = rel_path.split(os.sep)[0]
+            # 确保这个第一层名称确实是我们最初找到的一级目录
+            if first_level in first_level_dirs:
+                dicom_folders.append((root, first_level))
+            else:
+                # 如果不在第一层目录中，可能是根目录下的文件
+                dicom_folders.append((root, os.path.basename(root_path)))
+    return dicom_folders
+
+
+def process_sequence(dicom_folder, first_level_name, output_path):
+    """处理单个DICOM序列并保存为NIfTI"""
+    try:
+        # 读取DICOM文件
+        reader = sitk.ImageSeriesReader()
+        img_names = reader.GetGDCMSeriesFileNames(dicom_folder)
+        reader.SetFileNames(img_names)
+        img = reader.Execute()
+
+        # 使用第一层文件夹名称作为文件名
+        output_filename = f"{first_level_name}.nii"
+        output_filepath = os.path.join(output_path, output_filename)
+
+        # 保存为NIfTI格式
+        sitk.WriteImage(img, output_filepath)
+        print(f"成功保存: {output_filepath} (来自 {dicom_folder})")
+        return True
+    except Exception as e:
+        print(f"处理失败 {dicom_folder}: {str(e)}")
+        return False
+
+
+def process_all_dicom_folders(root_path, output_path):
+    """处理所有找到的DICOM文件夹"""
+    # 确保输出目录存在
+    os.makedirs(output_path, exist_ok=True)
+
+    # 查找所有包含DICOM的文件夹及其对应的第一层名称
+    dicom_folders = find_dicom_folders(root_path)
+
+    if not dicom_folders:
+        print(f"在 {root_path} 下未找到任何DICOM文件")
+        return
+
+    print(f"找到 {len(dicom_folders)} 个包含DICOM的文件夹")
+
+    # 处理每个找到的DICOM文件夹
+    success_count = 0
+    for folder, first_level_name in dicom_folders:
+        if process_sequence(folder, first_level_name, output_path):
+            success_count += 1
+
+    print(f"处理完成，成功转换 {success_count}/{len(dicom_folders)} 个序列")
+
+# 使用示例
+ct_root_path = r"D:\pancreas\Pancreas-CT" # 包含DICOM文件的根目录（可能多层嵌套）
+path_save =r"D:\pancreas\image" # 输出目录
+
+# 处理所有DICOM文件夹
+process_all_dicom_folders(ct_root_path, path_save)
+
+
+# # 使用示例
+# ct_root_path = r"D:\pancreas\Pancreas-CT" # 包含DICOM文件的根目录（可能多层嵌套）
+# path_save =r"D:\pancreas\newimage"  # 输出目录
+#
+# # 处理所有DICOM文件夹
+# process_all_dicom_folders(ct_root_path, path_save)
+# # 使用示例
+# input_folder = r"D:\pancreas\Pancreas-CT"
+# output_folder = r"D:\pancreas\newimage"
+# os.makedirs(output_folder, exist_ok=True)
+# dicom_to_nii(input_folder, output_folder)
